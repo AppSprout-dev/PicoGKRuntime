@@ -1050,6 +1050,28 @@ protected:
 
         void Run(int32_t x0, int32_t x1, int32_t y0, int32_t y1, int32_t z0, int32_t z1)
         {
+            // Corners already inside the narrow band means a coarse skip cannot
+            // fire on the samples we have (a gyroid is the usual case). The
+            // original loop then runs once; those corner samples stay cached.
+            bool bAllInBand = true;
+            for (int ix = 0; ix < 2 && bAllInBand; ix++)
+            for (int iy = 0; iy < 2 && bAllInBand; iy++)
+            for (int iz = 0; iz < 2 && bAllInBand; iz++)
+            {
+                int32_t x = ix ? x1 : x0;
+                int32_t y = iy ? y1 : y0;
+                int32_t z = iz ? z1 : z0;
+                if (std::fabs(fAt(x, y, z, true)) >= m_fB)
+                    bAllInBand = false;
+            }
+            if (bAllInBand)
+            {
+                m_oDense.push_back(Box{x0, x1, y0, y1, z0, z1});
+                auto oAccess = m_poSelf->m_roGrid->getAccessor();
+                ApplyDense(&oAccess, m_oDense.back());
+                return;
+            }
+
             Visit(x0, x1, y0, y1, z0, z1);
 
             for (const Box& oBox : m_oInside)
