@@ -49,6 +49,14 @@
 #include <openvdb/tools/LevelSetTubes.h>
 #include <openvdb/tools/LevelSetDilatedMesh.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+#include <vector>
+
 #include "PicoGKMesh.h"
 #include "PicoGKTrace.h"
 
@@ -361,25 +369,50 @@ public:
                             PKPFnfSdf pfn)
     {
         PKTRACE(Voxels_RenderImplicit);
-        
-        auto oAccess = m_roGrid->getAccessor();
-        
+
+        // Coarse blocks are skipped only when samples are consistent with a
+        // signed-distance Lipschitz bound and the whole block is strictly
+        // outside the narrow band (left as +background) or strictly inside
+        // (inactive -background). Anything else takes the original per-voxel
+        // loop, so narrow-band values stay the callback's floats. The callback
+        // stays on this thread; a worker pool would change the C# contract.
         Coord xyzMin = oVoxelSize().xyzToVoxels(oBBox.vecMin);
         Coord xyzMax = oVoxelSize().xyzToVoxels(oBBox.vecMax);
-        
-        for(int32_t x = xyzMin.X - m_nSdfNarrowBand; x <= xyzMax.X + m_nSdfNarrowBand; x++)
-        for(int32_t y = xyzMin.Y - m_nSdfNarrowBand; y <= xyzMax.Y + m_nSdfNarrowBand; y++)
-        for(int32_t z = xyzMin.Z - m_nSdfNarrowBand; z <= xyzMax.Z + m_nSdfNarrowBand; z++)
+        const int32_t x0 = xyzMin.X - m_nSdfNarrowBand;
+        const int32_t y0 = xyzMin.Y - m_nSdfNarrowBand;
+        const int32_t z0 = xyzMin.Z - m_nSdfNarrowBand;
+        const int32_t x1 = xyzMax.X + m_nSdfNarrowBand;
+        const int32_t y1 = xyzMax.Y + m_nSdfNarrowBand;
+        const int32_t z1 = xyzMax.Z + m_nSdfNarrowBand;
+
+        const bool bReference = bEnvFlag("PICOGK_IMPLICIT_REFERENCE");
+        const float fBackground = fBackgroundMM();
+        const std::int64_t nDomain = nImplicitDomain(x0, x1, y0, y1, z0, z1);
+        std::uint64_t nCalls = 0;
+
+        if (bReference || fBackground <= 0.0f || nDomain < 512)
         {
-            Vector3 vecSample = oVoxelSize().vecToMM(Coord(x,y,z));
-            openvdb::Coord xyz(x,y,z);
-            
-            float fValue = std::min(    (*pfn)(&vecSample),
-                                        oAccess.getValue(xyz));
-            
-            SetSdValue(&oAccess, xyz, fBackgroundMM(), fValue);
+            nCalls = RenderImplicitDense(x0, x1, y0, y1, z0, z1, pfn);
         }
-        
+        else
+        {
+            ImplicitCoarsen oCoarsen(this, pfn, fBackground, m_roGrid->tree().empty());
+            oCoarsen.Run(x0, x1, y0, y1, z0, z1);
+            nCalls = oCoarsen.m_nCalls;
+        }
+
+        if (bEnvFlag("PICOGK_IMPLICIT_STATS"))
+        {
+            const std::uint64_t nSkipped = (nCalls < static_cast<std::uint64_t>(nDomain))
+                ? (static_cast<std::uint64_t>(nDomain) - nCalls)
+                : 0;
+            std::fprintf(stderr,
+                "PICOGK_IMPLICIT_STATS domain=%lld calls=%llu skipped=%llu\n",
+                static_cast<long long>(nDomain),
+                static_cast<unsigned long long>(nCalls),
+                static_cast<unsigned long long>(nSkipped));
+        }
+
         RebuildGrid();
     }
     
@@ -906,6 +939,355 @@ protected:
         return false;
     }
     
+    static bool bEnvFlag(const char* pszName)
+    {
+        const char* psz = std::getenv(pszName);
+        return psz != nullptr && psz[0] == '1' && psz[1] == '\0';
+    }
+
+    static std::int64_t nImplicitDomain(   int32_t x0, int32_t x1,
+                                            int32_t y0, int32_t y1,
+                                            int32_t z0, int32_t z1)
+    {
+        if (x0 > x1 || y0 > y1 || z0 > z1)
+            return 0;
+        const std::int64_t nx = std::int64_t(x1) - x0 + 1;
+        const std::int64_t ny = std::int64_t(y1) - y0 + 1;
+        const std::int64_t nz = std::int64_t(z1) - z0 + 1;
+        return nx * ny * nz;
+    }
+
+    // Original serial loop. Kept as the fallback and as the reference path.
+    std::uint64_t RenderImplicitDense(  int32_t x0, int32_t x1,
+                                        int32_t y0, int32_t y1,
+                                        int32_t z0, int32_t z1,
+                                        PKPFnfSdf pfn)
+    {
+        auto oAccess = m_roGrid->getAccessor();
+        const float fBackground = fBackgroundMM();
+        std::uint64_t nCalls = 0;
+        for (int32_t x = x0; x <= x1; x++)
+        for (int32_t y = y0; y <= y1; y++)
+        for (int32_t z = z0; z <= z1; z++)
+        {
+            Vector3 vecSample = oVoxelSize().vecToMM(Coord(x, y, z));
+            openvdb::Coord xyz(x, y, z);
+            float fValue = std::min(    (*pfn)(&vecSample),
+                                        oAccess.getValue(xyz));
+            SetSdValue(&oAccess, xyz, fBackground, fValue);
+            nCalls++;
+        }
+        return nCalls;
+    }
+
+    // Hierarchical skip for RenderImplicit. Probe samples stay in a map so a
+    // voxel's callback runs at most once. Pruned outside voxels are not
+    // written: on an empty tree that is the same +background inactive state
+    // SetSdValue would store. Pruned inside voxels are inactive -background,
+    // which is what SetSdValue clamps to when the sample is <= -background.
+    struct ImplicitCoarsen
+    {
+        static constexpr float kLipschitz = 1.05f;
+        static constexpr float kSlack = 1.0e-4f;
+        static constexpr int kProbeCap = 24;
+
+        struct Key
+        {
+            int32_t x;
+            int32_t y;
+            int32_t z;
+            bool operator==(const Key& o) const
+            {
+                return x == o.x && y == o.y && z == o.z;
+            }
+        };
+
+        struct KeyHash
+        {
+            std::size_t operator()(const Key& k) const
+            {
+                std::size_t h = static_cast<std::size_t>(static_cast<std::uint32_t>(k.x)) * 73856093u;
+                h ^= static_cast<std::size_t>(static_cast<std::uint32_t>(k.y)) * 19349663u;
+                h ^= static_cast<std::size_t>(static_cast<std::uint32_t>(k.z)) * 83492791u;
+                return h;
+            }
+        };
+
+        struct Probe
+        {
+            int32_t x;
+            int32_t y;
+            int32_t z;
+            float value;
+        };
+
+        struct Box
+        {
+            int32_t x0, x1, y0, y1, z0, z1;
+        };
+
+        Voxels* m_poSelf;
+        PKPFnfSdf m_pfn;
+        float m_fH;
+        float m_fB;
+        bool m_bEmptyTree;
+        std::unordered_map<Key, float, KeyHash> m_oCache;
+        std::vector<Box> m_oInside;
+        std::vector<Box> m_oDense;
+        std::vector<Box> m_oOutsideFix;
+        std::uint64_t m_nCalls;
+
+        ImplicitCoarsen(Voxels* poSelf, PKPFnfSdf pfn, float fBackground, bool bEmptyTree)
+        : m_poSelf(poSelf)
+        , m_pfn(pfn)
+        , m_fH(poSelf->oVoxelSize())
+        , m_fB(fBackground)
+        , m_bEmptyTree(bEmptyTree)
+        , m_nCalls(0)
+        {
+            m_oCache.reserve(1 << 16);
+        }
+
+        void Run(int32_t x0, int32_t x1, int32_t y0, int32_t y1, int32_t z0, int32_t z1)
+        {
+            Visit(x0, x1, y0, y1, z0, z1);
+
+            for (const Box& oBox : m_oInside)
+            {
+                openvdb::Coord xyzMin(oBox.x0, oBox.y0, oBox.z0);
+                openvdb::Coord xyzMax(oBox.x1, oBox.y1, oBox.z1);
+                m_poSelf->m_roGrid->fill(openvdb::CoordBBox(xyzMin, xyzMax), -m_fB, false);
+            }
+
+            auto oAccess = m_poSelf->m_roGrid->getAccessor();
+            for (const Box& oBox : m_oDense)
+                ApplyDense(&oAccess, oBox);
+            for (const Box& oBox : m_oOutsideFix)
+                ApplyOutsideFix(&oAccess, oBox);
+        }
+
+        float fAt(int32_t x, int32_t y, int32_t z, bool bStore)
+        {
+            Key oKey{x, y, z};
+            auto it = m_oCache.find(oKey);
+            if (it != m_oCache.end())
+                return it->second;
+
+            Vector3 vecSample = m_poSelf->oVoxelSize().vecToMM(Coord(x, y, z));
+            float fValue = (*m_pfn)(&vecSample);
+            m_nCalls++;
+            if (bStore)
+                m_oCache.emplace(oKey, fValue);
+            return fValue;
+        }
+
+        static float fDist(const Probe& a, const Probe& b, float fH)
+        {
+            float dx = float(a.x - b.x) * fH;
+            float dy = float(a.y - b.y) * fH;
+            float dz = float(a.z - b.z) * fH;
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        bool bLipschitz(const Probe* p, int n) const
+        {
+            for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+            {
+                float fD = fDist(p[i], p[j], m_fH);
+                if (fD <= 0.0f)
+                    continue;
+                if (std::fabs(p[i].value - p[j].value) > kLipschitz * fD + 1.0e-3f)
+                    return false;
+            }
+            return true;
+        }
+
+        void fRange(const Probe* p, int n,
+                    int32_t x0, int32_t y0, int32_t z0,
+                    int32_t x1, int32_t y1, int32_t z1,
+                    float* pfMin, float* pfMax, float* pfDiag) const
+        {
+            float fMin = p[0].value;
+            float fMax = p[0].value;
+            for (int i = 1; i < n; i++)
+            {
+                fMin = std::min(fMin, p[i].value);
+                fMax = std::max(fMax, p[i].value);
+            }
+            float dx = float(x1 - x0) * m_fH;
+            float dy = float(y1 - y0) * m_fH;
+            float dz = float(z1 - z0) * m_fH;
+            *pfMin = fMin;
+            *pfMax = fMax;
+            *pfDiag = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        void Visit(int32_t x0, int32_t x1, int32_t y0, int32_t y1, int32_t z0, int32_t z1)
+        {
+            if (x0 > x1 || y0 > y1 || z0 > z1)
+                return;
+
+            const int32_t sx = x1 - x0 + 1;
+            const int32_t sy = y1 - y0 + 1;
+            const int32_t sz = z1 - z0 + 1;
+            const int32_t nSide = std::max(sx, std::max(sy, sz));
+
+            Probe oProbe[kProbeCap];
+            int nProbe = 0;
+            auto fAdd = [&](int32_t x, int32_t y, int32_t z)
+            {
+                if (x < x0 || x > x1 || y < y0 || y > y1 || z < z0 || z > z1)
+                    return;
+                for (int i = 0; i < nProbe; i++)
+                {
+                    if (oProbe[i].x == x && oProbe[i].y == y && oProbe[i].z == z)
+                        return;
+                }
+                if (nProbe >= kProbeCap)
+                    return;
+                oProbe[nProbe++] = Probe{x, y, z, fAt(x, y, z, true)};
+            };
+
+            fAdd(x0, y0, z0); fAdd(x1, y0, z0); fAdd(x0, y1, z0); fAdd(x1, y1, z0);
+            fAdd(x0, y0, z1); fAdd(x1, y0, z1); fAdd(x0, y1, z1); fAdd(x1, y1, z1);
+
+            bool bLip = bLipschitz(oProbe, nProbe);
+            float fMin = 0.0f, fMax = 0.0f, fDiag = 0.0f;
+            fRange(oProbe, nProbe, x0, y0, z0, x1, y1, z1, &fMin, &fMax, &fDiag);
+            const float fSafety = (nSide >= 8) ? 2.0f : 1.0f;
+            const float fReach = fSafety * kLipschitz * fDiag;
+            bool bOutside = bLip && (fMin - fReach >= m_fB + kSlack);
+            bool bInside = bLip && (fMax + fReach <= -m_fB - kSlack);
+
+            if (bOutside || bInside)
+            {
+                const int32_t cx = x0 + (x1 - x0) / 2;
+                const int32_t cy = y0 + (y1 - y0) / 2;
+                const int32_t cz = z0 + (z1 - z0) / 2;
+                fAdd(cx, cy, cz);
+                fAdd(cx, y0, cz); fAdd(cx, y1, cz);
+                fAdd(x0, cy, cz); fAdd(x1, cy, cz);
+                fAdd(cx, cy, z0); fAdd(cx, cy, z1);
+                if (nSide >= 8)
+                {
+                    const int32_t ax[2] = { x0 + (cx - x0) / 2, cx + (x1 - cx) / 2 };
+                    const int32_t ay[2] = { y0 + (cy - y0) / 2, cy + (y1 - cy) / 2 };
+                    const int32_t az[2] = { z0 + (cz - z0) / 2, cz + (z1 - cz) / 2 };
+                    for (int ix = 0; ix < 2; ix++)
+                    for (int iy = 0; iy < 2; iy++)
+                    for (int iz = 0; iz < 2; iz++)
+                        fAdd(ax[ix], ay[iy], az[iz]);
+                }
+                bLip = bLipschitz(oProbe, nProbe);
+                fRange(oProbe, nProbe, x0, y0, z0, x1, y1, z1, &fMin, &fMax, &fDiag);
+                const float fReach2 = fSafety * kLipschitz * fDiag;
+                bOutside = bLip && (fMin - fReach2 >= m_fB + kSlack);
+                bInside = bLip && (fMax + fReach2 <= -m_fB - kSlack);
+            }
+
+            if (bOutside && bInside)
+            {
+                bOutside = false;
+                bInside = false;
+            }
+
+            if (bOutside)
+            {
+                if (!m_bEmptyTree)
+                    m_oOutsideFix.push_back(Box{x0, x1, y0, y1, z0, z1});
+                return;
+            }
+            if (bInside)
+            {
+                m_oInside.push_back(Box{x0, x1, y0, y1, z0, z1});
+                return;
+            }
+            if (nSide > 4)
+            {
+                Subdivide(x0, x1, y0, y1, z0, z1);
+                return;
+            }
+            m_oDense.push_back(Box{x0, x1, y0, y1, z0, z1});
+        }
+
+        void Subdivide(int32_t x0, int32_t x1, int32_t y0, int32_t y1, int32_t z0, int32_t z1)
+        {
+            int32_t xs[2][2];
+            int32_t ys[2][2];
+            int32_t zs[2][2];
+            int nx = 1, ny = 1, nz = 1;
+            xs[0][0] = x0; xs[0][1] = x1;
+            ys[0][0] = y0; ys[0][1] = y1;
+            zs[0][0] = z0; zs[0][1] = z1;
+            if (x1 > x0)
+            {
+                int32_t m = x0 + (x1 - x0) / 2;
+                xs[0][0] = x0; xs[0][1] = m;
+                xs[1][0] = m + 1; xs[1][1] = x1;
+                nx = 2;
+            }
+            if (y1 > y0)
+            {
+                int32_t m = y0 + (y1 - y0) / 2;
+                ys[0][0] = y0; ys[0][1] = m;
+                ys[1][0] = m + 1; ys[1][1] = y1;
+                ny = 2;
+            }
+            if (z1 > z0)
+            {
+                int32_t m = z0 + (z1 - z0) / 2;
+                zs[0][0] = z0; zs[0][1] = m;
+                zs[1][0] = m + 1; zs[1][1] = z1;
+                nz = 2;
+            }
+            for (int ix = 0; ix < nx; ix++)
+            for (int iy = 0; iy < ny; iy++)
+            for (int iz = 0; iz < nz; iz++)
+            {
+                Visit(xs[ix][0], xs[ix][1], ys[iy][0], ys[iy][1], zs[iz][0], zs[iz][1]);
+            }
+        }
+
+        void ApplyDense(FloatGrid::Accessor* poAccess, const Box& oBox)
+        {
+            for (int32_t x = oBox.x0; x <= oBox.x1; x++)
+            for (int32_t y = oBox.y0; y <= oBox.y1; y++)
+            for (int32_t z = oBox.z0; z <= oBox.z1; z++)
+            {
+                openvdb::Coord xyz(x, y, z);
+                float fSample = fAt(x, y, z, false);
+                float fValue = std::min(fSample, poAccess->getValue(xyz));
+                SetSdValue(poAccess, xyz, m_fB, fValue);
+            }
+        }
+
+        void ApplyOutsideFix(FloatGrid::Accessor* poAccess, const Box& oBox)
+        {
+            // f >= background everywhere in this box. min(f, existing) is
+            // existing when existing <= background, and clamps to +background
+            // otherwise. Match that without another callback.
+            for (int32_t x = oBox.x0; x <= oBox.x1; x++)
+            for (int32_t y = oBox.y0; y <= oBox.y1; y++)
+            for (int32_t z = oBox.z0; z <= oBox.z1; z++)
+            {
+                openvdb::Coord xyz(x, y, z);
+                float fExisting = poAccess->getValue(xyz);
+                if (fExisting <= m_fB)
+                {
+                    bool bShouldOn = std::fabs(fExisting) < m_fB;
+                    float fShould = std::clamp(fExisting, -m_fB, m_fB);
+                    if (poAccess->isValueOn(xyz) != bShouldOn || poAccess->getValue(xyz) != fShould)
+                        SetSdValue(poAccess, xyz, m_fB, fExisting);
+                }
+                else if (poAccess->isValueOn(xyz) || poAccess->getValue(xyz) != m_fB)
+                {
+                    SetSdValue(poAccess, xyz, m_fB, m_fB);
+                }
+            }
+        }
+    };
+
     static void SetSdValue( FloatGrid::Accessor* poAccess,
                             openvdb::Coord xyz,
                             float fBackground,
