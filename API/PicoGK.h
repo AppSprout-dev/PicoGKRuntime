@@ -277,7 +277,8 @@ PICOGK_API void             Voxels_RenderMesh(              PKINSTANCE          
 // resources. A stateful implicit can race. Set PICOGK_IMPLICIT_SERIAL to
 // force the original single-threaded loop.
 //
-// The variable is trimmed of ASCII whitespace and compared case-insensitively.
+// The variable is read with getenv on every RenderImplicit call; it is not
+// cached. It is trimmed of ASCII whitespace and compared case-insensitively.
 // Serial: 1, true, yes, on.
 // Parallel: unset, empty, 0, false, no, off.
 // Any other value selects the serial path and prints one warning to stderr.

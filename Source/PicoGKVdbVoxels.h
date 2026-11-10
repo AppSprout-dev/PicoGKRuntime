@@ -385,8 +385,9 @@ public:
         // The callback must be pure in the sample point: no shared mutable
         // state and no thread-affine resources. A stateful implicit can race.
         //
-        // PICOGK_IMPLICIT_SERIAL is trimmed of ASCII whitespace and compared
-        // case-insensitively. Serial: 1, true, yes, on. Parallel: unset,
+        // PICOGK_IMPLICIT_SERIAL is read with getenv on every RenderImplicit
+        // call; it is not cached. The value is trimmed of ASCII whitespace and
+        // compared case-insensitively. Serial: 1, true, yes, on. Parallel: unset,
         // empty, 0, false, no, off. Any other value selects serial and prints
         // one warning to stderr.
         //
@@ -952,8 +953,9 @@ protected:
         }
     }
 
-    // Contiguous spans of the serial x, y, z index order. One shared buffer of
-    // nChunk floats (1<<20, 4 MiB) is filled in disjoint slots by workers
+    // Contiguous spans of the serial x, y, z index order. One shared buffer,
+    // allocated as min(nChunk, nDomain) floats (nChunk is 1<<20, so at most
+    // 4 MiB), is filled in disjoint slots by workers
     // (per-thread const accessors, no grid writes). The calling thread then
     // writes that span back with SetSdValue in x, y, z order.
     //
