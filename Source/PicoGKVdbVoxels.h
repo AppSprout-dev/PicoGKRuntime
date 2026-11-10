@@ -49,6 +49,14 @@
 #include <openvdb/tools/LevelSetTubes.h>
 #include <openvdb/tools/LevelSetDilatedMesh.h>
 
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+
 #include "PicoGKMesh.h"
 #include "PicoGKTrace.h"
 
@@ -361,25 +369,26 @@ public:
                             PKPFnfSdf pfn)
     {
         PKTRACE(Voxels_RenderImplicit);
-        
-        auto oAccess = m_roGrid->getAccessor();
-        
+
         Coord xyzMin = oVoxelSize().xyzToVoxels(oBBox.vecMin);
         Coord xyzMax = oVoxelSize().xyzToVoxels(oBBox.vecMax);
-        
-        for(int32_t x = xyzMin.X - m_nSdfNarrowBand; x <= xyzMax.X + m_nSdfNarrowBand; x++)
-        for(int32_t y = xyzMin.Y - m_nSdfNarrowBand; y <= xyzMax.Y + m_nSdfNarrowBand; y++)
-        for(int32_t z = xyzMin.Z - m_nSdfNarrowBand; z <= xyzMax.Z + m_nSdfNarrowBand; z++)
-        {
-            Vector3 vecSample = oVoxelSize().vecToMM(Coord(x,y,z));
-            openvdb::Coord xyz(x,y,z);
-            
-            float fValue = std::min(    (*pfn)(&vecSample),
-                                        oAccess.getValue(xyz));
-            
-            SetSdValue(&oAccess, xyz, fBackgroundMM(), fValue);
-        }
-        
+        const int32_t x0 = xyzMin.X - m_nSdfNarrowBand;
+        const int32_t y0 = xyzMin.Y - m_nSdfNarrowBand;
+        const int32_t z0 = xyzMin.Z - m_nSdfNarrowBand;
+        const int32_t x1 = xyzMax.X + m_nSdfNarrowBand;
+        const int32_t y1 = xyzMax.Y + m_nSdfNarrowBand;
+        const int32_t z1 = xyzMax.Z + m_nSdfNarrowBand;
+
+        // PICOGK_IMPLICIT_SERIAL=1 is the original loop, on this thread.
+        // Otherwise each chunk is evaluated through oneTBB. The bench sets
+        // tbb::global_control::max_allowed_parallelism before the library
+        // starts, and parallel_for uses that limit. Workers never write the
+        // grid. The calling thread applies values in the serial x,y,z order.
+        if (bImplicitSerial())
+            RenderImplicitSerial(x0, x1, y0, y1, z0, z1, pfn);
+        else
+            RenderImplicitParallel(x0, x1, y0, y1, z0, z1, pfn);
+
         RebuildGrid();
     }
     
@@ -906,6 +915,122 @@ protected:
         return false;
     }
     
+    static bool bImplicitSerial()
+    {
+        const char* psz = std::getenv("PICOGK_IMPLICIT_SERIAL");
+        return psz != nullptr && psz[0] == '1' && psz[1] == '\0';
+    }
+
+    // Original loop. One callback per voxel, on this thread, writing as it goes.
+    void RenderImplicitSerial(  int32_t x0, int32_t x1,
+                                int32_t y0, int32_t y1,
+                                int32_t z0, int32_t z1,
+                                PKPFnfSdf pfn)
+    {
+        auto oAccess = m_roGrid->getAccessor();
+        const float fBackground = fBackgroundMM();
+        for (int32_t x = x0; x <= x1; x++)
+        for (int32_t y = y0; y <= y1; y++)
+        for (int32_t z = z0; z <= z1; z++)
+        {
+            Vector3 vecSample = oVoxelSize().vecToMM(Coord(x, y, z));
+            openvdb::Coord xyz(x, y, z);
+            float fValue = std::min(    (*pfn)(&vecSample),
+                                        oAccess.getValue(xyz));
+            SetSdValue(&oAccess, xyz, fBackground, fValue);
+        }
+    }
+
+    // Contiguous spans of the serial index order. Each span is evaluated into
+    // a private buffer (per-thread const accessors, no grid writes), then the
+    // calling thread runs SetSdValue in that same order. A voxel is visited
+    // once, so the value read is the grid from before this call.
+    void RenderImplicitParallel(    int32_t x0, int32_t x1,
+                                    int32_t y0, int32_t y1,
+                                    int32_t z0, int32_t z1,
+                                    PKPFnfSdf pfn)
+    {
+        std::int64_t nX = 0;
+        std::int64_t nY = 0;
+        std::int64_t nZ = 0;
+        if (!bImplicitExtents(x0, x1, y0, y1, z0, z1, nX, nY, nZ))
+            return;
+        if (nY > (INT64_C(0x7fffffffffffffff) / nZ))
+        {
+            RenderImplicitSerial(x0, x1, y0, y1, z0, z1, pfn);
+            return;
+        }
+        const std::int64_t nPlane = nY * nZ;
+        if (nX > (INT64_C(0x7fffffffffffffff) / nPlane))
+        {
+            RenderImplicitSerial(x0, x1, y0, y1, z0, z1, pfn);
+            return;
+        }
+        const std::int64_t nDomain = nX * nPlane;
+        const std::int64_t nChunk = std::int64_t(1) << 20;
+        const float fBackground = fBackgroundMM();
+        std::vector<float> afValues(static_cast<size_t>(std::min(nChunk, nDomain)));
+
+        auto xyzAt = [&](std::int64_t iIndex, int32_t& x, int32_t& y, int32_t& z)
+        {
+            const std::int64_t iX = iIndex / nPlane;
+            const std::int64_t iRem = iIndex - iX * nPlane;
+            const std::int64_t iY = iRem / nZ;
+            const std::int64_t iZ = iRem - iY * nZ;
+            x = x0 + static_cast<int32_t>(iX);
+            y = y0 + static_cast<int32_t>(iY);
+            z = z0 + static_cast<int32_t>(iZ);
+        };
+
+        for (std::int64_t i0 = 0; i0 < nDomain; i0 += nChunk)
+        {
+            const std::int64_t nHere = std::min(nChunk, nDomain - i0);
+            tbb::parallel_for(
+                tbb::blocked_range<std::int64_t>(0, nHere),
+                [&](const tbb::blocked_range<std::int64_t>& oRange)
+                {
+                    auto oRead = m_roGrid->getConstAccessor();
+                    for (std::int64_t iLocal = oRange.begin(); iLocal != oRange.end(); ++iLocal)
+                    {
+                        int32_t x = 0;
+                        int32_t y = 0;
+                        int32_t z = 0;
+                        xyzAt(i0 + iLocal, x, y, z);
+                        Vector3 vecSample = oVoxelSize().vecToMM(Coord(x, y, z));
+                        openvdb::Coord xyz(x, y, z);
+                        afValues[static_cast<size_t>(iLocal)] = std::min(
+                            (*pfn)(&vecSample),
+                            oRead.getValue(xyz));
+                    }
+                });
+
+            auto oAccess = m_roGrid->getAccessor();
+            for (std::int64_t iLocal = 0; iLocal < nHere; ++iLocal)
+            {
+                int32_t x = 0;
+                int32_t y = 0;
+                int32_t z = 0;
+                xyzAt(i0 + iLocal, x, y, z);
+                SetSdValue(&oAccess, openvdb::Coord(x, y, z), fBackground, afValues[static_cast<size_t>(iLocal)]);
+            }
+        }
+    }
+
+    static bool bImplicitExtents(  int32_t x0, int32_t x1,
+                                    int32_t y0, int32_t y1,
+                                    int32_t z0, int32_t z1,
+                                    std::int64_t& nX,
+                                    std::int64_t& nY,
+                                    std::int64_t& nZ)
+    {
+        if (x0 > x1 || y0 > y1 || z0 > z1)
+            return false;
+        nX = std::int64_t(x1) - x0 + 1;
+        nY = std::int64_t(y1) - y0 + 1;
+        nZ = std::int64_t(z1) - z0 + 1;
+        return nX > 0 && nY > 0 && nZ > 0;
+    }
+
     static void SetSdValue( FloatGrid::Accessor* poAccess,
                             openvdb::Coord xyz,
                             float fBackground,
