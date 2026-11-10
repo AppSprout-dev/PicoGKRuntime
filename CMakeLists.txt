@@ -211,7 +211,7 @@ set_target_properties(${LIB_NAME} PROPERTIES DEBUG_POSTFIX "d")
 add_executable(APITests)
 
 # Add the main.cpp file from APITests directory
-target_sources(APITests PRIVATE APITests/main.cpp)
+target_sources(APITests PRIVATE APITests/main.cpp APITests/ImplicitSerialParse.cpp)
 
 # Link the APITests executable with the library target
 target_link_libraries(APITests PRIVATE ${LIB_NAME})

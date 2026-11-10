@@ -10,4 +10,17 @@ PicoGK Runtime is based on the [OpenVDB](https://github.com/AcademySoftwareFound
 
 For more information, [please see the main PicoGK repository](https://github.com/leap71/PicoGK).
 
-PicoGK was developed by Lin Kayser, and is maintained by [LEAP 71](www.leap71.com). PicoGK and PicoGK Runtime are released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) (SPDX Apache-2.0).  
+PicoGK was developed by Lin Kayser, and is maintained by [LEAP 71](www.leap71.com). PicoGK and PicoGK Runtime are released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) (SPDX Apache-2.0).
+
+## RenderImplicit threading
+
+`Voxels_RenderImplicit` evaluates the signed-distance callback on oneTBB worker threads by default. The callback must be pure in the sample point: no shared mutable state and no thread-affine resources. A stateful implicit can race. Set `PICOGK_IMPLICIT_SERIAL` to force the original single-threaded loop.
+
+The variable is trimmed of ASCII whitespace (space, tab, CR, LF, VT, FF) and compared case-insensitively:
+
+- Serial: `1`, `true`, `yes`, `on`
+- Parallel: unset, empty, `0`, `false`, `no`, `off`
+
+Any other value selects the serial path and prints one warning to stderr.
+
+Two behaviors of the parallel path are part of the contract. A callback that samples the field it is rendering sees that field's state from before the current chunk is written back. If a worker throws, chunks already written stay written and the chunk in flight is not, which is a different partial grid than the serial loop. The serial loop writes each voxel before the next sample.

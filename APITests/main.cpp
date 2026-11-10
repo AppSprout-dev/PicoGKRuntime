@@ -22,6 +22,8 @@
 #include <thread>
 #include <assert.h>
 
+bool bRunImplicitSerialParseTests();
+
 // Change this to run tests
 #define TESTFILE_PATH "/Users/yourusername/PicoGK_Testfiles"
 
@@ -182,6 +184,9 @@ void MouseButton(   PKVIEWER    hViewer,
 
 int main(int argc, const char * argv[])
 {
+    if (!bRunImplicitSerialParseTests())
+        return 1;
+
     char pszInfo[PKINFOSTRINGLEN];
     
     Library_GetName(pszInfo);
