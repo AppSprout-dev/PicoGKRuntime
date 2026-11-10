@@ -57,6 +57,7 @@
 #include <cstdlib>
 #include <vector>
 
+#include "PicoGKImplicitSerial.h"
 #include "PicoGKMesh.h"
 #include "PicoGKTrace.h"
 
@@ -379,11 +380,22 @@ public:
         const int32_t y1 = xyzMax.Y + m_nSdfNarrowBand;
         const int32_t z1 = xyzMax.Z + m_nSdfNarrowBand;
 
-        // PICOGK_IMPLICIT_SERIAL=1 is the original loop, on this thread.
-        // Otherwise each chunk is evaluated through oneTBB. The bench sets
-        // tbb::global_control::max_allowed_parallelism before the library
-        // starts, and parallel_for uses that limit. Workers never write the
-        // grid. The calling thread applies values in the serial x,y,z order.
+        // The signed-distance callback runs on oneTBB worker threads unless
+        // PICOGK_IMPLICIT_SERIAL selects the original loop on this thread.
+        // The callback must be pure in the sample point: no shared mutable
+        // state and no thread-affine resources. A stateful implicit can race.
+        //
+        // PICOGK_IMPLICIT_SERIAL is trimmed of ASCII whitespace and compared
+        // case-insensitively. Serial: 1, true, yes, on. Parallel: unset,
+        // empty, 0, false, no, off. Any other value selects serial and prints
+        // one warning to stderr.
+        //
+        // parallel_for honors tbb::global_control::max_allowed_parallelism
+        // when that limit is set before the library starts. Workers never
+        // write the grid. The calling thread applies values in x, y, z order.
+        // A callback that samples this field sees pre-chunk state. A worker
+        // exception leaves different partial grid state than the serial path.
+        // Both are described on RenderImplicitParallel.
         if (bImplicitSerial())
             RenderImplicitSerial(x0, x1, y0, y1, z0, z1, pfn);
         else
@@ -917,8 +929,7 @@ protected:
     
     static bool bImplicitSerial()
     {
-        const char* psz = std::getenv("PICOGK_IMPLICIT_SERIAL");
-        return psz != nullptr && psz[0] == '1' && psz[1] == '\0';
+        return bImplicitSerialRequested();
     }
 
     // Original loop. One callback per voxel, on this thread, writing as it goes.
@@ -941,10 +952,19 @@ protected:
         }
     }
 
-    // Contiguous spans of the serial index order. Each span is evaluated into
-    // a private buffer (per-thread const accessors, no grid writes), then the
-    // calling thread runs SetSdValue in that same order. A voxel is visited
-    // once, so the value read is the grid from before this call.
+    // Contiguous spans of the serial x, y, z index order. One shared buffer of
+    // nChunk floats (1<<20, 4 MiB) is filled in disjoint slots by workers
+    // (per-thread const accessors, no grid writes). The calling thread then
+    // writes that span back with SetSdValue in x, y, z order.
+    //
+    // A callback that samples the field being rendered sees pre-chunk state.
+    // Earlier chunks are already written; this chunk is not written until
+    // every sample in it has returned. Each voxel is visited once.
+    //
+    // A worker exception leaves different partial grid state than the serial
+    // path. The serial loop writes each voxel before the next sample, so an
+    // exception keeps that prefix. Here the in-flight chunk is not written
+    // back, and only earlier whole chunks remain.
     void RenderImplicitParallel(    int32_t x0, int32_t x1,
                                     int32_t y0, int32_t y1,
                                     int32_t z0, int32_t z1,

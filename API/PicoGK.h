@@ -272,6 +272,20 @@ PICOGK_API void             Voxels_RenderMesh(              PKINSTANCE          
                                                             PKVOXELS            hThis,
                                                             PKMESH              hMesh);
 
+// Evaluates pfnSDF on oneTBB worker threads by default. The callback must
+// be pure in the sample point: no shared mutable state and no thread-affine
+// resources. A stateful implicit can race. Set PICOGK_IMPLICIT_SERIAL to
+// force the original single-threaded loop.
+//
+// The variable is trimmed of ASCII whitespace and compared case-insensitively.
+// Serial: 1, true, yes, on.
+// Parallel: unset, empty, 0, false, no, off.
+// Any other value selects the serial path and prints one warning to stderr.
+//
+// A callback that samples the field it is rendering sees that field's
+// pre-chunk state. An exception thrown on a worker leaves different partial
+// grid state than the serial path (earlier whole chunks stay written; the
+// chunk in flight is not).
 PICOGK_API void             Voxels_RenderImplicit(          PKINSTANCE          hInstance,
                                                             PKVOXELS            hThis,
                                                             const PKBBox3*      poBBox,

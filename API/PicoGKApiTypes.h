@@ -118,7 +118,11 @@ struct PKColorFloat
 
 #endif // Definition of basic types
 
-// Implicit rendering callback function
+// Implicit rendering callback function.
+// Voxels_RenderImplicit runs this on oneTBB worker threads unless
+// PICOGK_IMPLICIT_SERIAL selects the serial path, so the function must be
+// pure in pvecCoord: no shared mutable state and no thread-affine resources.
+// See Voxels_RenderImplicit for the accepted environment values.
 
 typedef float (*PKPFnfSdf)(const PKVector3* pvecCoord);
 
