@@ -111,11 +111,14 @@ add_library(${LIB_NAME} SHARED)
 
 # Add a preprocessor definition for the debug build
 target_compile_definitions(${LIB_NAME} PRIVATE $<$<CONFIG:Debug>:DEBUG_BUILD>)
-# Compiles the optional AVX2 mesh-voxel neighbor path. It stays off unless
-# PICOGK_MESH_AVX2 is set, so the scalar meshToVolume loop remains the default.
+# Compiles the optional AVX2 mesh-voxel neighbor path on x86-64 only.
+# It stays off unless PICOGK_MESH_AVX2 is set. Every other target compiles
+# the scalar meshToVolume loop and does not see immintrin.h.
 # The OpenVDB header is spliced into the build tree only, so the submodule
 # stays clean.
-target_compile_definitions(${LIB_NAME} PRIVATE PICOGK_MESH_AVX2_HOOK)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+    target_compile_definitions(${LIB_NAME} PRIVATE PICOGK_MESH_AVX2_HOOK)
+endif()
 set(_picogk_mesh_avx_inc "${CMAKE_CURRENT_BINARY_DIR}/picogk-mesh-avx")
 set(_picogk_mesh_hdr "${_picogk_mesh_avx_inc}/openvdb/tools/MeshToVolume.h")
 set(_picogk_mesh_src "${CMAKE_CURRENT_SOURCE_DIR}/openvdb/openvdb/openvdb/tools/MeshToVolume.h")
@@ -124,9 +127,10 @@ add_custom_command(
     OUTPUT "${_picogk_mesh_hdr}"
     COMMAND ${CMAKE_COMMAND}
         -DSRC=${_picogk_mesh_src}
+        -DPROX=${CMAKE_CURRENT_SOURCE_DIR}/openvdb/openvdb/openvdb/math/Proximity.cc
         -DDST=${_picogk_mesh_hdr}
         -P ${_picogk_mesh_splice}
-    DEPENDS "${_picogk_mesh_src}" "${_picogk_mesh_splice}"
+    DEPENDS "${_picogk_mesh_src}" "${_picogk_mesh_splice}" "${CMAKE_CURRENT_SOURCE_DIR}/openvdb/openvdb/openvdb/math/Proximity.cc"
     COMMENT "Splicing the optional AVX2 neighbor path into MeshToVolume.h"
     VERBATIM
 )

@@ -1,9 +1,49 @@
 # Copies MeshToVolume.h and splices in the optional AVX2 neighbor path.
 # The OpenVDB submodule stays untouched. Fails if the anchor text moves.
-if(NOT DEFINED SRC OR NOT DEFINED DST)
-    message(FATAL_ERROR "SRC and DST are required")
+if(NOT DEFINED SRC OR NOT DEFINED DST OR NOT DEFINED PROX)
+    message(FATAL_ERROR "SRC, DST, and PROX are required")
 endif()
 file(READ "${SRC}" text)
+file(READ "${PROX}" prox_text)
+
+# The AVX flood copies these two functions. A submodule bump that changes
+# either one fails here instead of silently drifting from the scalar path.
+function(picogk_require_snippet name source begin end expected_sha)
+    string(FIND "${source}" "${begin}" begin_at)
+    if(begin_at LESS 0)
+        message(FATAL_ERROR "${name} anchor was not found; the AVX2 splice is refusing to build")
+    endif()
+    string(SUBSTRING "${source}" "${begin_at}" -1 tail)
+    string(FIND "${tail}" "${end}" end_at)
+    if(end_at LESS 0)
+        message(FATAL_ERROR "${name} end anchor was not found; the AVX2 splice is refusing to build")
+    endif()
+    string(SUBSTRING "${tail}" 0 "${end_at}" snippet)
+    string(SHA256 got "${snippet}")
+    if(NOT got STREQUAL expected_sha)
+        message(FATAL_ERROR
+            "${name} drifted from the copy in the AVX2 splice (sha256 ${got}, expected ${expected_sha}). "
+            "Update the kernel before building.")
+    endif()
+endfunction()
+set(prox_begin [=[OPENVDB_API Vec3d
+closestPointOnTriangleToPoint(]=])
+set(prox_end [=[OPENVDB_API Vec3d
+closestPointOnSegmentToPoint(]=])
+picogk_require_snippet(
+    "Proximity.cc closestPointOnTriangleToPoint"
+    "${prox_text}"
+    "${prox_begin}"
+    "${prox_end}"
+    "5d9a661e98f5b169fb22ff4d925c8b9a3451672f11189ff9b27468944664a354")
+set(dist_begin "static bool updateDistance(const Coord& ijk, const Triangle& prim, VoxelizationDataType& data)")
+set(dist_end "\n    DataTable")
+picogk_require_snippet(
+    "MeshToVolume.h updateDistance"
+    "${text}"
+    "${dist_begin}"
+    "${dist_end}"
+    "3dba4f79bbb26d116e4093d847df5c1f691fc9057f4d47b2d803532752ed0a10")
 set(old_inc [=[
 #include <tbb/task_arena.h>
 
@@ -11,7 +51,7 @@ set(old_inc [=[
 set(new_inc [=[
 #include <tbb/task_arena.h>
 
-#ifdef PICOGK_MESH_AVX2_HOOK
+#if defined(PICOGK_MESH_AVX2_HOOK) && (defined(__x86_64__) || defined(_M_X64))
 #include "PicoGKMeshVoxelAvx.h"
 #if defined(_MSC_VER)
 #define PICOGK_MESH_NOINLINE __declspec(noinline)
@@ -61,7 +101,7 @@ set(old_body [=[
 ]=])
 set(new_body [=[
     // Separate from voxelizeTriangle so the scalar flood keeps its original body.
-#ifdef PICOGK_MESH_AVX2_HOOK
+#if defined(PICOGK_MESH_AVX2_HOOK) && (defined(__x86_64__) || defined(_M_X64))
     PICOGK_MESH_NOINLINE static void voxelizeTriangleAvx(
         const Triangle& prim,
         VoxelizationDataType& data,
@@ -152,7 +192,7 @@ set(new_body [=[
         unsigned char primId = data.getNewPrimId();
         data.primIdAcc.setValueOnly(ijk, primId);
 
-#ifdef PICOGK_MESH_AVX2_HOOK
+#if defined(PICOGK_MESH_AVX2_HOOK) && (defined(__x86_64__) || defined(_M_X64))
         if (PicoGK::bMeshVoxelAvx2()) {
             const bool bDegenerateTriangle =
                 (math::isApproxEqual(prim.a, prim.b) && math::isApproxEqual(prim.a, prim.c))

@@ -9,8 +9,19 @@
 #ifndef PICOGK_MESH_VOXEL_AVX_H_
 #define PICOGK_MESH_VOXEL_AVX_H_
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+
+// Intrinsics stay inside the x86-64 branch. arm64 and every other target
+// compile only the scalar stub, even if a build system defines the hook.
+#if defined(__x86_64__) || defined(_M_X64)
+// cl.exe only. clang-cl defines _MSC_VER too, and it keeps the Clang path.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
 #include <immintrin.h>
+#endif
 
 namespace PicoGK
 {
@@ -38,15 +49,46 @@ inline bool bMeshVoxelIsSpace(unsigned char uc)
 }
 
 // PICOGK_MESH_AVX2 selects the AVX2 neighbor distance path in meshToVolume.
-// Truthy, trimmed, case-insensitive: 1, true, yes, on.
-// Unset, empty, and every other value keep the scalar path. Read once.
+// On, trimmed, case-insensitive: 1, true, yes, on.
+// Scalar, no warning: unset, empty, 0, false, no, off.
+// Any other value stays on the scalar path and prints one warning to stderr.
+// Read once. Only compiled into the x86-64 hook.
+#if defined(__x86_64__) || defined(_M_X64)
+
+#if defined(_MSC_VER) && !defined(__clang__)
+inline bool bMeshVoxelCpuAvx2()
+{
+    int aInfo[4] = {0, 0, 0, 0};
+    __cpuid(aInfo, 0);
+    if (aInfo[0] < 7)
+        return false;
+    __cpuid(aInfo, 1);
+    const bool bOsxsave = (aInfo[2] & (1 << 27)) != 0;
+    const bool bAvx = (aInfo[2] & (1 << 28)) != 0;
+    if (!bOsxsave || !bAvx)
+        return false;
+    // OSXSAVE is set. YMM state is usable only when XCR0 bits 1 and 2 are set.
+    const unsigned long long nXcr0 = static_cast<unsigned long long>(_xgetbv(0));
+    if ((nXcr0 & 0x6ull) != 0x6ull)
+        return false;
+    __cpuidex(aInfo, 7, 0);
+    return (aInfo[1] & (1 << 5)) != 0;
+}
+#define PICOGK_MESH_AVX_FN
+#else
+inline bool bMeshVoxelCpuAvx2()
+{
+    return __builtin_cpu_supports("avx2");
+}
+#define PICOGK_MESH_AVX_FN __attribute__((target("avx2")))
+#endif
+
 inline bool bMeshVoxelAvx2()
 {
     static const bool bEnabled = []()
     {
-        if (!__builtin_cpu_supports("avx2"))
-            return false;
-        const char* psz = std::getenv("PICOGK_MESH_AVX2");
+        const char* pszRaw = std::getenv("PICOGK_MESH_AVX2");
+        const char* psz = pszRaw;
         if (psz == nullptr)
             return false;
         while (*psz != '\0' && bMeshVoxelIsSpace(static_cast<unsigned char>(*psz)))
@@ -56,16 +98,35 @@ inline bool bMeshVoxelAvx2()
             ++pszEnd;
         while (pszEnd > psz && bMeshVoxelIsSpace(static_cast<unsigned char>(pszEnd[-1])))
             --pszEnd;
-        return bMeshVoxelToken(psz, pszEnd, "1")
+        if (psz == pszEnd)
+            return false;
+        if (bMeshVoxelToken(psz, pszEnd, "1")
             || bMeshVoxelToken(psz, pszEnd, "true")
             || bMeshVoxelToken(psz, pszEnd, "yes")
-            || bMeshVoxelToken(psz, pszEnd, "on");
+            || bMeshVoxelToken(psz, pszEnd, "on"))
+            return bMeshVoxelCpuAvx2();
+        if (bMeshVoxelToken(psz, pszEnd, "0")
+            || bMeshVoxelToken(psz, pszEnd, "false")
+            || bMeshVoxelToken(psz, pszEnd, "no")
+            || bMeshVoxelToken(psz, pszEnd, "off"))
+            return false;
+        static std::atomic<bool> bWarned{false};
+        if (!bWarned.exchange(true))
+        {
+            std::fprintf(stderr,
+                "PICOGK_MESH_AVX2=\"%s\" is not recognized; mesh voxelization is using the scalar path. "
+                "AVX2 values: 1, true, yes, on. Scalar values: unset, empty, 0, false, no, off.\n",
+                pszRaw);
+        }
+        return false;
     }();
     return bEnabled;
 }
 
 // Four closest points on a non-degenerate triangle. p and cp are xyz xyz xyz xyz.
-__attribute__((target("avx2")))
+// cl.exe accepts the AVX2 intrinsics without a target attribute.
+// clang-cl is Clang, so it keeps the target attribute below.
+PICOGK_MESH_AVX_FN
 inline void closestPointsOnTriangle4(
     const double a[3], const double b[3], const double c[3],
     const double p[12], double cp[12])
@@ -206,6 +267,15 @@ inline void closestPointsOnTriangle4(
     }
 #undef PICOGK_DOT3
 }
+
+#else
+
+inline bool bMeshVoxelAvx2()
+{
+    return false;
+}
+
+#endif // x86-64
 
 } // namespace PicoGK
 

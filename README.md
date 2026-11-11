@@ -29,4 +29,4 @@ Two behaviors of the parallel path are part of the contract. A callback that sam
 
 ## Mesh voxelization
 
-`Voxels_RenderMesh` keeps the scalar OpenVDB mesh voxelizer unless `PICOGK_MESH_AVX2` is set to `1`, `true`, `yes`, or `on` (trimmed, case-insensitive) on a machine with AVX2. Unset, empty, and every other value stay on the scalar path. The switch is read once per process. Degenerate triangles stay on the scalar path either way.
+`Voxels_RenderMesh` keeps the scalar OpenVDB mesh voxelizer unless `PICOGK_MESH_AVX2` is set to `1`, `true`, `yes`, or `on` (trimmed, case-insensitive) on an x86-64 machine with AVX2. Unset, empty, `0`, `false`, `no`, and `off` stay on the scalar path. Any other value stays on the scalar path and prints one warning to stderr. The switch is read once per process. Degenerate triangles stay on the scalar path either way. Other architectures compile the scalar path only.
