@@ -14,7 +14,9 @@ PicoGK was developed by Lin Kayser, and is maintained by [LEAP 71](www.leap71.co
 
 ## RenderImplicit threading
 
-`Voxels_RenderImplicit` evaluates the signed-distance callback on oneTBB worker threads by default. The callback must be pure in the sample point: no shared mutable state and no thread-affine resources. A stateful implicit can race. Set `PICOGK_IMPLICIT_SERIAL` to force the original single-threaded loop.
+`Voxels_RenderImplicit` evaluates the signed-distance callback on oneTBB worker threads by default. The callback must be pure in the sample point: no shared mutable state and no thread-affine resources. A stateful implicit can race. Set `PICOGK_IMPLICIT_SERIAL` to force the original single-threaded loop. `Voxels_IntersectImplicit` calls `RenderImplicit`, so it uses the same callback contract.
+
+`PICOGK_IMPLICIT_SERIAL` is read with `getenv` on every `RenderImplicit` call. It is not cached.
 
 The variable is trimmed of ASCII whitespace (space, tab, CR, LF, VT, FF) and compared case-insensitively:
 
@@ -24,3 +26,7 @@ The variable is trimmed of ASCII whitespace (space, tab, CR, LF, VT, FF) and com
 Any other value selects the serial path and prints one warning to stderr.
 
 Two behaviors of the parallel path are part of the contract. A callback that samples the field it is rendering sees that field's state from before the current chunk is written back. If a worker throws, chunks already written stay written and the chunk in flight is not, which is a different partial grid than the serial loop. The serial loop writes each voxel before the next sample.
+
+## Mesh voxelization
+
+`Voxels_RenderMesh` keeps the scalar OpenVDB mesh voxelizer unless `PICOGK_MESH_AVX2` is set to `1`, `true`, `yes`, or `on` (trimmed, case-insensitive) on an x86-64 machine with AVX2. Unset, empty, `0`, `false`, `no`, and `off` stay on the scalar path. Any other value stays on the scalar path and prints one warning to stderr. The switch is read once per process. Degenerate triangles stay on the scalar path either way. Other architectures compile the scalar path only.

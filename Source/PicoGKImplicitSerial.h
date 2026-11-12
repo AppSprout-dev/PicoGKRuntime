@@ -114,6 +114,7 @@ inline EImplicitSerial eParseImplicitSerial(const char* psz)
 }
 
 // True when RenderImplicit must stay on the calling thread.
+// getenv("PICOGK_IMPLICIT_SERIAL") is read on every call; the mode is not cached.
 // An unrecognized PICOGK_IMPLICIT_SERIAL value is serial, and the first
 // such value in the process prints one warning to stderr.
 inline bool bImplicitSerialRequested()
