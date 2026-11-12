@@ -107,9 +107,13 @@ set(new_body [=[
         VoxelizationDataType& data,
         Interrupter* const interrupter,
         std::deque<Coord>& coordList,
-        Coord ijk,
-        unsigned char primId)
+        Coord ijk)
     {
+        PicoGK::floodVisit().begin(
+            prim.a[0], prim.a[1], prim.a[2],
+            prim.b[0], prim.b[1], prim.b[2],
+            prim.c[0], prim.c[1], prim.c[2],
+            ijk[0], ijk[1], ijk[2]);
         Coord nijk;
         while (!coordList.empty()) {
             if (interrupter && interrupter->wasInterrupted()) {
@@ -162,8 +166,7 @@ set(new_body [=[
                 };
                 for (Int32 i = 0; i < 26; ++i) {
                     nijk = ijk + util::COORD_OFFSETS[i];
-                    if (primId != data.primIdAcc.getValue(nijk)) {
-                        data.primIdAcc.setValueOnly(nijk, primId);
+                    if (PicoGK::floodVisit().mark(nijk[0], nijk[1], nijk[2])) {
                         aPending[nPending] = nijk;
                         ++nPending;
                         if (nPending == 4)
@@ -189,9 +192,6 @@ set(new_body [=[
         // so we cannot early-exit here.
         updateDistance(ijk, prim, data);
 
-        unsigned char primId = data.getNewPrimId();
-        data.primIdAcc.setValueOnly(ijk, primId);
-
 #if defined(PICOGK_MESH_AVX2_HOOK) && (defined(__x86_64__) || defined(_M_X64))
         if (PicoGK::bMeshVoxelAvx2()) {
             const bool bDegenerateTriangle =
@@ -200,11 +200,14 @@ set(new_body [=[
                 || math::isApproxEqual(prim.a, prim.c)
                 || math::isApproxEqual(prim.b, prim.c);
             if (!bDegenerateTriangle) {
-                voxelizeTriangleAvx(prim, data, interrupter, coordList, ijk, primId);
+                voxelizeTriangleAvx(prim, data, interrupter, coordList, ijk);
                 return;
             }
         }
 #endif
+
+        unsigned char primId = data.getNewPrimId();
+        data.primIdAcc.setValueOnly(ijk, primId);
 
         while (!coordList.empty()) {
             if (interrupter && interrupter->wasInterrupted()) {
