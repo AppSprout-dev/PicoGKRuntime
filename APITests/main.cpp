@@ -23,6 +23,7 @@
 #include <assert.h>
 
 bool bRunImplicitSerialParseTests();
+bool bRunFloodVisitWrapTest();
 
 // Change this to run tests
 #define TESTFILE_PATH "/Users/yourusername/PicoGK_Testfiles"
@@ -185,6 +186,8 @@ void MouseButton(   PKVIEWER    hViewer,
 int main(int argc, const char * argv[])
 {
     if (!bRunImplicitSerialParseTests())
+        return 1;
+    if (!bRunFloodVisitWrapTest())
         return 1;
 
     char pszInfo[PKINFOSTRINGLEN];

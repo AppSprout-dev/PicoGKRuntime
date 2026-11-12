@@ -108,6 +108,7 @@ set(new_body [=[
         Interrupter* const interrupter,
         std::deque<Coord>& coordList,
         Coord ijk,
+        bool bSideTable,
         unsigned char primId)
     {
         Coord nijk;
@@ -162,8 +163,12 @@ set(new_body [=[
                 };
                 for (Int32 i = 0; i < 26; ++i) {
                     nijk = ijk + util::COORD_OFFSETS[i];
-                    if (primId != data.primIdAcc.getValue(nijk)) {
-                        data.primIdAcc.setValueOnly(nijk, primId);
+                    const bool bNew = bSideTable
+                        ? PicoGK::floodVisit().mark(nijk[0], nijk[1], nijk[2])
+                        : primId != data.primIdAcc.getValue(nijk);
+                    if (bNew) {
+                        if (!bSideTable)
+                            data.primIdAcc.setValueOnly(nijk, primId);
                         aPending[nPending] = nijk;
                         ++nPending;
                         if (nPending == 4)
@@ -189,9 +194,6 @@ set(new_body [=[
         // so we cannot early-exit here.
         updateDistance(ijk, prim, data);
 
-        unsigned char primId = data.getNewPrimId();
-        data.primIdAcc.setValueOnly(ijk, primId);
-
 #if defined(PICOGK_MESH_AVX2_HOOK) && (defined(__x86_64__) || defined(_M_X64))
         if (PicoGK::bMeshVoxelAvx2()) {
             const bool bDegenerateTriangle =
@@ -200,11 +202,28 @@ set(new_body [=[
                 || math::isApproxEqual(prim.a, prim.c)
                 || math::isApproxEqual(prim.b, prim.c);
             if (!bDegenerateTriangle) {
-                voxelizeTriangleAvx(prim, data, interrupter, coordList, ijk, primId);
+                // A triangle that does not fit in the dense side table keeps
+                // the primId visit set. The AVX distance batch stays the same.
+                const bool bSideTable = PicoGK::floodVisit().begin(
+                    prim.a[0], prim.a[1], prim.a[2],
+                    prim.b[0], prim.b[1], prim.b[2],
+                    prim.c[0], prim.c[1], prim.c[2],
+                    ijk[0], ijk[1], ijk[2]);
+                unsigned char primId = 0;
+                if (!bSideTable) {
+                    primId = data.getNewPrimId();
+                    data.primIdAcc.setValueOnly(ijk, primId);
+                }
+                voxelizeTriangleAvx(prim, data, interrupter, coordList, ijk, bSideTable, primId);
+                if (bSideTable)
+                    PicoGK::floodVisit().end();
                 return;
             }
         }
 #endif
+
+        unsigned char primId = data.getNewPrimId();
+        data.primIdAcc.setValueOnly(ijk, primId);
 
         while (!coordList.empty()) {
             if (interrupter && interrupter->wasInterrupted()) {

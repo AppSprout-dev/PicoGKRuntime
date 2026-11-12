@@ -10,8 +10,12 @@
 #define PICOGK_MESH_VOXEL_AVX_H_
 
 #include <atomic>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 // Intrinsics stay inside the x86-64 branch. arm64 and every other target
 // compile only the scalar stub, even if a build system defines the hook.
@@ -121,6 +125,196 @@ inline bool bMeshVoxelAvx2()
         return false;
     }();
     return bEnabled;
+}
+
+// Per-triangle visit set for the AVX flood. The scratch primId tree stays the
+// scalar path's record, and it is also the visit set for a triangle whose box
+// does not fit in the dense table. This table answers the same "already
+// visited" question for one triangle, including the seed, so the distance and
+// index writes do not move.
+class FloodVisit
+{
+public:
+    // True when this triangle fits in the dense table. A false return leaves
+    // the visit set to the primId tree; the hash is not grown for that triangle.
+    bool begin(double ax, double ay, double az,
+               double bx, double by, double bz,
+               double cx, double cy, double cz,
+               int sx, int sy, int sz)
+    {
+        const double xLo = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
+        const double yLo = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
+        const double zLo = az < bz ? (az < cz ? az : cz) : (bz < cz ? bz : cz);
+        const double xHi = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx);
+        const double yHi = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
+        const double zHi = az > bz ? (az > cz ? az : cz) : (bz > cz ? bz : cz);
+        const int xmin = static_cast<int>(std::floor(xLo)) - 2;
+        const int ymin = static_cast<int>(std::floor(yLo)) - 2;
+        const int zmin = static_cast<int>(std::floor(zLo)) - 2;
+        const int xmax = static_cast<int>(std::floor(xHi)) + 2;
+        const int ymax = static_cast<int>(std::floor(yHi)) + 2;
+        const int zmax = static_cast<int>(std::floor(zHi)) + 2;
+        mX0 = xmin;
+        mY0 = ymin;
+        mZ0 = zmin;
+        const long long nx = static_cast<long long>(xmax) - xmin + 1;
+        const long long ny = static_cast<long long>(ymax) - ymin + 1;
+        const long long nz = static_cast<long long>(zmax) - zmin + 1;
+        const long long nCells = (nx > 0 && ny > 0 && nz > 0) ? nx * ny * nz : 0;
+        mDense = nCells > 0 && nCells <= (1 << 20);
+        if (!mDense)
+            return false;
+        hashNewTriangle();
+        mNx = static_cast<int>(nx);
+        mNy = static_cast<int>(ny);
+        mNz = static_cast<int>(nz);
+        if (mStamp.size() < static_cast<size_t>(nCells))
+            mStamp.assign(static_cast<size_t>(nCells), 0u);
+        if (mDenseGen == 0xffffffffu)
+        {
+            // The retained buffer can be larger than this triangle. A partial
+            // clear would leave stale generation numbers in the tail.
+            std::fill(mStamp.begin(), mStamp.end(), 0u);
+            mDenseGen = 1;
+        }
+        else
+            ++mDenseGen;
+        mark(sx, sy, sz);
+        return true;
+    }
+
+    // Drop a hash that grew past the retain cap. The next triangle allocates
+    // again from the small initial size. Called after that triangle's flood.
+    void end()
+    {
+        if (mHashMask + 1 > kHashRetain)
+        {
+            std::vector<int>().swap(mHashX);
+            std::vector<int>().swap(mHashY);
+            std::vector<int>().swap(mHashZ);
+            std::vector<uint32_t>().swap(mHashStamp);
+            mHashMask = 0;
+            mHashCount = 0;
+        }
+    }
+
+    // Test hook. Sets the dense generation so the next begin() takes the wrap path.
+    void forceDenseGenForTest(uint32_t nGen)
+    {
+        mDenseGen = nGen;
+    }
+
+    // True when this voxel was not already marked for the current triangle.
+    bool mark(int x, int y, int z)
+    {
+        if (mDense)
+        {
+            const int ix = x - mX0;
+            const int iy = y - mY0;
+            const int iz = z - mZ0;
+            if (static_cast<unsigned>(ix) < static_cast<unsigned>(mNx)
+                && static_cast<unsigned>(iy) < static_cast<unsigned>(mNy)
+                && static_cast<unsigned>(iz) < static_cast<unsigned>(mNz))
+            {
+                const size_t i = static_cast<size_t>(ix)
+                    + static_cast<size_t>(mNx) * (static_cast<size_t>(iy)
+                    + static_cast<size_t>(mNy) * static_cast<size_t>(iz));
+                if (mStamp[i] == mDenseGen)
+                    return false;
+                mStamp[i] = mDenseGen;
+                return true;
+            }
+        }
+        return hashMark(x, y, z);
+    }
+
+private:
+    void hashNewTriangle()
+    {
+        if (mHashGen == 0xffffffffu)
+        {
+            std::fill(mHashStamp.begin(), mHashStamp.end(), 0u);
+            mHashGen = 1;
+        }
+        else
+            ++mHashGen;
+        mHashCount = 0;
+    }
+
+    static uint32_t mix(int x, int y, int z)
+    {
+        uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B1u;
+        h ^= static_cast<uint32_t>(y) * 0x85EBCA77u;
+        h ^= static_cast<uint32_t>(z) * 0xC2B2AE3Du;
+        h ^= h >> 16;
+        return h;
+    }
+
+    bool hashMark(int x, int y, int z)
+    {
+        if (mHashMask == 0)
+            hashRehash(1024);
+        else if (mHashCount * 2 > mHashMask)
+            hashRehash((mHashMask + 1) * 2);
+        size_t i = static_cast<size_t>(mix(x, y, z)) & mHashMask;
+        for (;;)
+        {
+            if (mHashStamp[i] != mHashGen)
+            {
+                mHashStamp[i] = mHashGen;
+                mHashX[i] = x;
+                mHashY[i] = y;
+                mHashZ[i] = z;
+                ++mHashCount;
+                return true;
+            }
+            if (mHashX[i] == x && mHashY[i] == y && mHashZ[i] == z)
+                return false;
+            i = (i + 1) & mHashMask;
+        }
+    }
+
+    void hashRehash(size_t cap)
+    {
+        std::vector<int> oldX, oldY, oldZ;
+        std::vector<uint32_t> oldStamp;
+        oldX.swap(mHashX);
+        oldY.swap(mHashY);
+        oldZ.swap(mHashZ);
+        oldStamp.swap(mHashStamp);
+        const uint32_t gen = mHashGen;
+        mHashX.assign(cap, 0);
+        mHashY.assign(cap, 0);
+        mHashZ.assign(cap, 0);
+        mHashStamp.assign(cap, 0u);
+        mHashMask = cap - 1;
+        mHashCount = 0;
+        for (size_t i = 0; i < oldStamp.size(); ++i)
+        {
+            if (oldStamp[i] == gen)
+                hashMark(oldX[i], oldY[i], oldZ[i]);
+        }
+    }
+
+    // Slots kept on the thread after a triangle. A flood that needs more
+    // grows the hash, and end() frees it back to this size.
+    static constexpr size_t kHashRetain = 4096;
+
+    bool mDense = false;
+    int mX0 = 0, mY0 = 0, mZ0 = 0, mNx = 0, mNy = 0, mNz = 0;
+    uint32_t mDenseGen = 0;
+    std::vector<uint32_t> mStamp;
+    uint32_t mHashGen = 0;
+    size_t mHashMask = 0;
+    size_t mHashCount = 0;
+    std::vector<uint32_t> mHashStamp;
+    std::vector<int> mHashX, mHashY, mHashZ;
+};
+
+inline FloodVisit& floodVisit()
+{
+    thread_local FloodVisit oVisit;
+    return oVisit;
 }
 
 // Four closest points on a non-degenerate triangle. p and cp are xyz xyz xyz xyz.
