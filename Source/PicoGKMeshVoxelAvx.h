@@ -128,17 +128,20 @@ inline bool bMeshVoxelAvx2()
 }
 
 // Per-triangle visit set for the AVX flood. The scratch primId tree stays the
-// scalar path's record. This table answers the same "already visited" question
-// for one triangle, including the seed, so the distance and index writes do not move.
+// scalar path's record, and it is also the visit set for a triangle whose box
+// does not fit in the dense table. This table answers the same "already
+// visited" question for one triangle, including the seed, so the distance and
+// index writes do not move.
 class FloodVisit
 {
 public:
-    void begin(double ax, double ay, double az,
+    // True when this triangle fits in the dense table. A false return leaves
+    // the visit set to the primId tree; the hash is not grown for that triangle.
+    bool begin(double ax, double ay, double az,
                double bx, double by, double bz,
                double cx, double cy, double cz,
                int sx, int sy, int sz)
     {
-        hashNewTriangle();
         const double xLo = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
         const double yLo = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
         const double zLo = az < bz ? (az < cz ? az : cz) : (bz < cz ? bz : cz);
@@ -159,22 +162,46 @@ public:
         const long long nz = static_cast<long long>(zmax) - zmin + 1;
         const long long nCells = (nx > 0 && ny > 0 && nz > 0) ? nx * ny * nz : 0;
         mDense = nCells > 0 && nCells <= (1 << 20);
-        if (mDense)
+        if (!mDense)
+            return false;
+        hashNewTriangle();
+        mNx = static_cast<int>(nx);
+        mNy = static_cast<int>(ny);
+        mNz = static_cast<int>(nz);
+        if (mStamp.size() < static_cast<size_t>(nCells))
+            mStamp.assign(static_cast<size_t>(nCells), 0u);
+        if (mDenseGen == 0xffffffffu)
         {
-            mNx = static_cast<int>(nx);
-            mNy = static_cast<int>(ny);
-            mNz = static_cast<int>(nz);
-            if (mStamp.size() < static_cast<size_t>(nCells))
-                mStamp.assign(static_cast<size_t>(nCells), 0u);
-            if (mDenseGen == 0xffffffffu)
-            {
-                std::fill(mStamp.begin(), mStamp.begin() + static_cast<size_t>(nCells), 0u);
-                mDenseGen = 1;
-            }
-            else
-                ++mDenseGen;
+            // The retained buffer can be larger than this triangle. A partial
+            // clear would leave stale generation numbers in the tail.
+            std::fill(mStamp.begin(), mStamp.end(), 0u);
+            mDenseGen = 1;
         }
+        else
+            ++mDenseGen;
         mark(sx, sy, sz);
+        return true;
+    }
+
+    // Drop a hash that grew past the retain cap. The next triangle allocates
+    // again from the small initial size. Called after that triangle's flood.
+    void end()
+    {
+        if (mHashMask + 1 > kHashRetain)
+        {
+            std::vector<int>().swap(mHashX);
+            std::vector<int>().swap(mHashY);
+            std::vector<int>().swap(mHashZ);
+            std::vector<uint32_t>().swap(mHashStamp);
+            mHashMask = 0;
+            mHashCount = 0;
+        }
+    }
+
+    // Test hook. Sets the dense generation so the next begin() takes the wrap path.
+    void forceDenseGenForTest(uint32_t nGen)
+    {
+        mDenseGen = nGen;
     }
 
     // True when this voxel was not already marked for the current triangle.
@@ -268,6 +295,10 @@ private:
                 hashMark(oldX[i], oldY[i], oldZ[i]);
         }
     }
+
+    // Slots kept on the thread after a triangle. A flood that needs more
+    // falls through to the primId tree instead of retaining a larger table.
+    static constexpr size_t kHashRetain = 4096;
 
     bool mDense = false;
     int mX0 = 0, mY0 = 0, mZ0 = 0, mNx = 0, mNy = 0, mNz = 0;
