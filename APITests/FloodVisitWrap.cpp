@@ -15,6 +15,7 @@
 #include <set>
 #include <tuple>
 
+#if defined(__x86_64__) || defined(_M_X64)
 namespace
 {
 
@@ -57,6 +58,7 @@ bool bBeginSmall(PicoGK::FloodVisit& oVisit)
 }
 
 } // namespace
+#endif
 
 bool bRunFloodVisitWrapTest()
 {

@@ -297,7 +297,7 @@ private:
     }
 
     // Slots kept on the thread after a triangle. A flood that needs more
-    // falls through to the primId tree instead of retaining a larger table.
+    // grows the hash, and end() frees it back to this size.
     static constexpr size_t kHashRetain = 4096;
 
     bool mDense = false;
