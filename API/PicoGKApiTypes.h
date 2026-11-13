@@ -126,6 +126,17 @@ struct PKColorFloat
 
 typedef float (*PKPFnfSdf)(const PKVector3* pvecCoord);
 
+// Batch signed-distance callback. pvecPoints holds nCount points in the
+// same x, y, z order as Voxels_RenderImplicit. Write nCount distances to
+// pfDistances. Voxels_RenderImplicitBatch calls this on oneTBB workers for
+// disjoint slices of a chunk unless PICOGK_IMPLICIT_SERIAL selects the
+// serial path. The same purity rules as PKPFnfSdf apply: no shared mutable
+// state and no thread-affine resources.
+
+typedef void (*PKPFnfSdfBatch)( const PKVector3* pvecPoints,
+                                float*           pfDistances,
+                                int32_t          nCount);
+
 // Callback iterating across active voxels
 
 typedef void (*PKFnTraverseActiveS)(    const PKVector3* pvecCoord,

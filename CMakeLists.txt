@@ -263,15 +263,24 @@ add_custom_command(
     COMMENT "Copying library files to Dist folder"
 )
 
-add_custom_command(
-    TARGET ${LIB_NAME} PRE_BUILD
+# PRE_BUILD is pre-link on Make and Ninja, so the objects compile the
+# committed API/PicoGKBuild.h and only then rewrite it. Generate the header
+# first, into the build tree, and put that directory ahead of API/.
+set(_picogk_build_inc "${CMAKE_CURRENT_BINARY_DIR}/picogk-build")
+add_custom_target(picogk_build_header
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_picogk_build_inc}"
     COMMAND ${CMAKE_COMMAND} -E echo "Creating build headers..."
-    COMMAND ${CMAKE_COMMAND} 	-DAPIDIR=${CMAKE_CURRENT_SOURCE_DIR}/API 
-    							-DLIB_VERSION=${LIB_VERSION}
-    							-DLIB_NAME=${LIB_NAME}
-    							-P ${CMAKE_CURRENT_SOURCE_DIR}/CMake_Utils/PicoGKBuildHeader.cmake
+    COMMAND ${CMAKE_COMMAND}
+        -DAPIDIR=${_picogk_build_inc}
+        -DLIB_VERSION=${LIB_VERSION}
+        -DLIB_NAME=${LIB_NAME}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/CMake_Utils/PicoGKBuildHeader.cmake
+    BYPRODUCTS "${_picogk_build_inc}/PicoGKBuild.h"
     COMMENT "Create build headers"
+    VERBATIM
 )
+add_dependencies(${LIB_NAME} picogk_build_header)
+target_include_directories(${LIB_NAME} BEFORE PRIVATE "${_picogk_build_inc}")
 
 
 

@@ -292,9 +292,23 @@ PICOGK_API void             Voxels_RenderImplicit(          PKINSTANCE          
                                                             const PKBBox3*      poBBox,
                                                             PKPFnfSdf           pfnSDF);
 
+// Same chunk order, threading, and PICOGK_IMPLICIT_SERIAL rules as
+// Voxels_RenderImplicit. pfnSDF receives a contiguous slice of the chunk
+// and writes one distance per point. The per-point entry is unchanged.
+PICOGK_API void             Voxels_RenderImplicitBatch(     PKINSTANCE          hInstance,
+                                                            PKVOXELS            hThis,
+                                                            const PKBBox3*      poBBox,
+                                                            PKPFnfSdfBatch      pfnSDF);
+
 PICOGK_API void             Voxels_IntersectImplicit(       PKINSTANCE          hInstance,
                                                             PKVOXELS            hThis,
                                                             PKPFnfSdf           pfnSDF);
+
+// Same mask as Voxels_IntersectImplicit. The temporary field is filled
+// with Voxels_RenderImplicitBatch.
+PICOGK_API void             Voxels_IntersectImplicitBatch(  PKINSTANCE          hInstance,
+                                                            PKVOXELS            hThis,
+                                                            PKPFnfSdfBatch      pfnSDF);
 
 PICOGK_API void             Voxels_RenderLattice(           PKINSTANCE          hInstance,
                                                             PKVOXELS            hThis,

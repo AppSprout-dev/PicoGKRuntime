@@ -566,6 +566,17 @@ PICOGK_API void Voxels_RenderImplicit(  PKINSTANCE hLib,
                             pfnSDF);
 }
 
+PICOGK_API void Voxels_RenderImplicitBatch( PKINSTANCE hLib,
+                                            PKVOXELS hThis,
+                                            const PKBBox3* poBBox,
+                                            PKPFnfSdfBatch pfnSDF)
+{
+    Library::Instance::Ptr roLib = Library::oLib().roGetInstance(hLib);
+    roLib->m_oVoxels.roGet(hThis)
+        ->RenderImplicitBatch(  *poBBox,
+                                pfnSDF);
+}
+
 PICOGK_API void Voxels_IntersectImplicit(   PKINSTANCE hLib,
                                             PKVOXELS hThis,
                                             PKPFnfSdf pfnSDF)
@@ -573,6 +584,15 @@ PICOGK_API void Voxels_IntersectImplicit(   PKINSTANCE hLib,
     Library::Instance::Ptr roLib = Library::oLib().roGetInstance(hLib);
     roLib->m_oVoxels.roGet(hThis)
         ->IntersectImplicit(    pfnSDF);
+}
+
+PICOGK_API void Voxels_IntersectImplicitBatch(  PKINSTANCE hLib,
+                                                PKVOXELS hThis,
+                                                PKPFnfSdfBatch pfnSDF)
+{
+    Library::Instance::Ptr roLib = Library::oLib().roGetInstance(hLib);
+    roLib->m_oVoxels.roGet(hThis)
+        ->IntersectImplicitBatch(   pfnSDF);
 }
 
 PICOGK_API void Voxels_RenderLattice(   PKINSTANCE hLib,

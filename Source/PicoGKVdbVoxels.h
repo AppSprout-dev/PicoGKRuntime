@@ -51,10 +51,13 @@
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <tbb/partitioner.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "PicoGKImplicitSerial.h"
@@ -430,6 +433,30 @@ public:
         // implicit grid is "perfect"
         m_roGrid.swap(oVox.m_roGrid);
         
+        BoolIntersect(oVox);
+    }
+
+    void IntersectImplicitBatch(PKPFnfSdfBatch pfn)
+    {
+        PKTRACE(Voxels_IntersectImplicitBatch);
+
+        Voxels oVox(oVoxelSize(), m_nSdfNarrowBand);
+
+        CoordBBox oBBox = m_roGrid->evalActiveVoxelBoundingBox();
+
+        BBox3 oBBoxMM;
+        oBBoxMM.vecMin.X = oVoxelSize().fToMM(oBBox.min().x());
+        oBBoxMM.vecMin.Y = oVoxelSize().fToMM(oBBox.min().y());
+        oBBoxMM.vecMin.Z = oVoxelSize().fToMM(oBBox.min().z());
+
+        oBBoxMM.vecMax.X = oVoxelSize().fToMM(oBBox.max().x());
+        oBBoxMM.vecMax.Y = oVoxelSize().fToMM(oBBox.max().y());
+        oBBoxMM.vecMax.Z = oVoxelSize().fToMM(oBBox.max().z());
+
+        oVox.RenderImplicitBatch(oBBoxMM, pfn);
+
+        m_roGrid.swap(oVox.m_roGrid);
+
         BoolIntersect(oVox);
     }
 
@@ -1025,6 +1052,178 @@ protected:
                             oRead.getValue(xyz));
                     }
                 });
+
+            auto oAccess = m_roGrid->getAccessor();
+            for (std::int64_t iLocal = 0; iLocal < nHere; ++iLocal)
+            {
+                int32_t x = 0;
+                int32_t y = 0;
+                int32_t z = 0;
+                xyzAt(i0 + iLocal, x, y, z);
+                SetSdValue(&oAccess, openvdb::Coord(x, y, z), fBackground, afValues[static_cast<size_t>(iLocal)]);
+            }
+        }
+    }
+
+public:
+
+    // Same index order and 2^20 writeback chunk as RenderImplicitParallel.
+    // Each worker calls pfn on a contiguous slice of that chunk (at least
+    // 2^12 points, except the tail) and does not write the grid. The calling
+    // thread applies the slice results with SetSdValue in x, y, z order.
+    // A callback that samples this field sees pre-chunk state.
+    void RenderImplicitBatch(   const BBox3& oBBox,
+                                PKPFnfSdfBatch pfn)
+    {
+        PKTRACE(Voxels_RenderImplicitBatch);
+
+        static_assert(sizeof(Vector3) == 12, "batch points must match the C# Vector3 layout");
+        static_assert(offsetof(Vector3, X) == 0);
+        static_assert(offsetof(Vector3, Y) == 4);
+        static_assert(offsetof(Vector3, Z) == 8);
+
+        Coord xyzMin = oVoxelSize().xyzToVoxels(oBBox.vecMin);
+        Coord xyzMax = oVoxelSize().xyzToVoxels(oBBox.vecMax);
+        const int32_t x0 = xyzMin.X - m_nSdfNarrowBand;
+        const int32_t y0 = xyzMin.Y - m_nSdfNarrowBand;
+        const int32_t z0 = xyzMin.Z - m_nSdfNarrowBand;
+        const int32_t x1 = xyzMax.X + m_nSdfNarrowBand;
+        const int32_t y1 = xyzMax.Y + m_nSdfNarrowBand;
+        const int32_t z1 = xyzMax.Z + m_nSdfNarrowBand;
+
+        if (bImplicitSerial())
+            RenderImplicitBatchSerial(x0, x1, y0, y1, z0, z1, pfn);
+        else
+            RenderImplicitBatchParallel(x0, x1, y0, y1, z0, z1, pfn);
+
+        RebuildGrid();
+    }
+
+protected:
+
+    void RenderImplicitBatchSerial( int32_t x0, int32_t x1,
+                                    int32_t y0, int32_t y1,
+                                    int32_t z0, int32_t z1,
+                                    PKPFnfSdfBatch pfn)
+    {
+        auto oAccess = m_roGrid->getAccessor();
+        const float fBackground = fBackgroundMM();
+        const std::int64_t nGrain = std::int64_t(1) << 12;
+        std::vector<Vector3> ovecPoints;
+        std::vector<openvdb::Coord> oxyz;
+        std::vector<float> afValues;
+        ovecPoints.reserve(static_cast<size_t>(nGrain));
+        oxyz.reserve(static_cast<size_t>(nGrain));
+        afValues.reserve(static_cast<size_t>(nGrain));
+
+        auto Flush = [&]()
+        {
+            const int32_t nCount = static_cast<int32_t>(ovecPoints.size());
+            if (nCount == 0)
+                return;
+            afValues.resize(static_cast<size_t>(nCount));
+            (*pfn)(ovecPoints.data(), afValues.data(), nCount);
+            for (int32_t n = 0; n < nCount; ++n)
+            {
+                const openvdb::Coord& xyz = oxyz[static_cast<size_t>(n)];
+                const float fValue = std::min(afValues[static_cast<size_t>(n)], oAccess.getValue(xyz));
+                SetSdValue(&oAccess, xyz, fBackground, fValue);
+            }
+            ovecPoints.clear();
+            oxyz.clear();
+        };
+
+        for (int32_t x = x0; x <= x1; x++)
+        for (int32_t y = y0; y <= y1; y++)
+        for (int32_t z = z0; z <= z1; z++)
+        {
+            ovecPoints.push_back(oVoxelSize().vecToMM(Coord(x, y, z)));
+            oxyz.emplace_back(x, y, z);
+            if (static_cast<std::int64_t>(ovecPoints.size()) >= nGrain)
+                Flush();
+        }
+        Flush();
+    }
+
+    void RenderImplicitBatchParallel(   int32_t x0, int32_t x1,
+                                        int32_t y0, int32_t y1,
+                                        int32_t z0, int32_t z1,
+                                        PKPFnfSdfBatch pfn)
+    {
+        std::int64_t nX = 0;
+        std::int64_t nY = 0;
+        std::int64_t nZ = 0;
+        if (!bImplicitExtents(x0, x1, y0, y1, z0, z1, nX, nY, nZ))
+            return;
+        if (nY > (INT64_C(0x7fffffffffffffff) / nZ))
+        {
+            RenderImplicitBatchSerial(x0, x1, y0, y1, z0, z1, pfn);
+            return;
+        }
+        const std::int64_t nPlane = nY * nZ;
+        if (nX > (INT64_C(0x7fffffffffffffff) / nPlane))
+        {
+            RenderImplicitBatchSerial(x0, x1, y0, y1, z0, z1, pfn);
+            return;
+        }
+        const std::int64_t nDomain = nX * nPlane;
+        const std::int64_t nChunk = std::int64_t(1) << 20;
+        const std::int64_t nGrain = std::int64_t(1) << 12;
+        const float fBackground = fBackgroundMM();
+        const size_t nBuffer = static_cast<size_t>(std::min(nChunk, nDomain));
+        std::vector<float> afValues(nBuffer);
+        // Three floats per point, aligned like Vector3. Workers write the
+        // slots they own. Nothing is constructed up front.
+        std::vector<float> afPointXYZ(nBuffer * 3);
+        Vector3* pPoints = reinterpret_cast<Vector3*>(afPointXYZ.data());
+
+        auto xyzAt = [&](std::int64_t iIndex, int32_t& x, int32_t& y, int32_t& z)
+        {
+            const std::int64_t iX = iIndex / nPlane;
+            const std::int64_t iRem = iIndex - iX * nPlane;
+            const std::int64_t iY = iRem / nZ;
+            const std::int64_t iZ = iRem - iY * nZ;
+            x = x0 + static_cast<int32_t>(iX);
+            y = y0 + static_cast<int32_t>(iY);
+            z = z0 + static_cast<int32_t>(iZ);
+        };
+
+        for (std::int64_t i0 = 0; i0 < nDomain; i0 += nChunk)
+        {
+            const std::int64_t nHere = std::min(nChunk, nDomain - i0);
+            // simple_partitioner keeps each callback at the grain size.
+            // The default auto partitioner may split a slice down to one
+            // point, which puts the per-point transition cost back.
+            tbb::parallel_for(
+                tbb::blocked_range<std::int64_t>(0, nHere, nGrain),
+                [&](const tbb::blocked_range<std::int64_t>& oRange)
+                {
+                    auto oRead = m_roGrid->getConstAccessor();
+                    for (std::int64_t iLocal = oRange.begin(); iLocal != oRange.end(); ++iLocal)
+                    {
+                        int32_t x = 0;
+                        int32_t y = 0;
+                        int32_t z = 0;
+                        xyzAt(i0 + iLocal, x, y, z);
+                        Vector3 vecSample = oVoxelSize().vecToMM(Coord(x, y, z));
+                        std::memcpy(pPoints + iLocal, &vecSample, sizeof(Vector3));
+                    }
+                    const std::int64_t nSlice = oRange.end() - oRange.begin();
+                    (*pfn)( pPoints + oRange.begin(),
+                            &afValues[static_cast<size_t>(oRange.begin())],
+                            static_cast<int32_t>(nSlice));
+                    for (std::int64_t iLocal = oRange.begin(); iLocal != oRange.end(); ++iLocal)
+                    {
+                        int32_t x = 0;
+                        int32_t y = 0;
+                        int32_t z = 0;
+                        xyzAt(i0 + iLocal, x, y, z);
+                        afValues[static_cast<size_t>(iLocal)] = std::min(
+                            afValues[static_cast<size_t>(iLocal)],
+                            oRead.getValue(openvdb::Coord(x, y, z)));
+                    }
+                },
+                tbb::simple_partitioner());
 
             auto oAccess = m_roGrid->getAccessor();
             for (std::int64_t iLocal = 0; iLocal < nHere; ++iLocal)
